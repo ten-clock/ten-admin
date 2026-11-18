@@ -7,7 +7,7 @@
 #   GHCR_PULL_TOKEN      拉取私有镜像用 PAT（scope: read:packages）；公开 Package 可省略
 #
 # 可选 Variables：
-#   DEPLOY_CONTAINER_PORT  宿主机端口，默认 80（映射容器 8080）
+#   DEPLOY_CONTAINER_PORT  宿主机端口，默认 8090（映射容器 8080）
 #
 name: Deploy Playground Docker
 
@@ -71,7 +71,7 @@ jobs:
           REGISTRY: ${{ env.REGISTRY }}
           IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
-          HOST_PORT: ${{ vars.DEPLOY_CONTAINER_PORT || '80' }}
+          HOST_PORT: ${{ vars.DEPLOY_CONTAINER_PORT || '8090' }}
           GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
           GHCR_USER: ${{ github.repository_owner }}
         with:
