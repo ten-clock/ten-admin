@@ -78,18 +78,31 @@ jobs:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
+          command_timeout: 45m
           envs: REGISTRY,IMAGE,CONTAINER_NAME,HOST_PORT,GHCR_PULL_TOKEN,GHCR_USER
           script: |
             set -e
-            if [ -n "$GHCR_PULL_TOKEN" ]; then
-              echo "$GHCR_PULL_TOKEN" | docker login "$REGISTRY" -u "$GHCR_USER" --password-stdin
+            if docker info >/dev/null 2>&1; then
+              DOCKER=docker
+            elif sudo docker info >/dev/null 2>&1; then
+              DOCKER="sudo docker"
+            else
+              echo "Cannot access Docker. Run: sudo usermod -aG docker $USER && re-login"
+              exit 1
             fi
-            docker pull "$IMAGE"
-            docker stop "$CONTAINER_NAME" 2>/dev/null || true
-            docker rm "$CONTAINER_NAME" 2>/dev/null || true
-            docker run -d \
+            echo "==> login ghcr.io"
+            if [ -n "$GHCR_PULL_TOKEN" ]; then
+              echo "$GHCR_PULL_TOKEN" | $DOCKER login "$REGISTRY" -u "$GHCR_USER" --password-stdin
+            fi
+            echo "==> pull $IMAGE (may take several minutes from China)"
+            $DOCKER pull "$IMAGE"
+            echo "==> restart container"
+            $DOCKER stop "$CONTAINER_NAME" 2>/dev/null || true
+            $DOCKER rm "$CONTAINER_NAME" 2>/dev/null || true
+            $DOCKER run -d \
               --name "$CONTAINER_NAME" \
               --restart unless-stopped \
               -p "${HOST_PORT}:8080" \
               "$IMAGE"
-            docker image prune -f
+            $DOCKER image prune -f
+            echo "==> deploy done"
