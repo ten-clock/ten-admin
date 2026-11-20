@@ -6,15 +6,15 @@
 
 ## 1. 项目背景与目标
 
-| 项       | 说明                                                          |
-| -------- | ------------------------------------------------------------- |
-| 仓库     | [ten-clock/ten-admin](https://github.com/ten-clock/ten-admin) |
-| 触发分支 | `main`                                                        |
-| 部署产物 | Playground 前端静态站点（`pnpm run build:play`）              |
-| 运行方式 | 容器内 Nginx 提供静态文件                                     |
-| 镜像仓库 | GitHub Container Registry（`ghcr.io`）                        |
+| 项 | 说明 |
+| --- | --- |
+| 仓库 | [ten-clock/ten-admin](https://github.com/ten-clock/ten-admin) |
+| 触发分支 | `main` |
+| 部署产物 | Playground 前端静态站点（`pnpm run build:play`） |
+| 运行方式 | 容器内 Nginx 提供静态文件 |
+| 部署方式 | GHA 构建 `dist` → SCP 上传 → **CVM 本地 `docker build`**（不依赖 TCR/GHCR pull） |
 
-**业务目标**：推送 `main` 后自动构建镜像、在腾讯云服务器上拉取并重启容器，无需在服务器上手动手动构建。
+**业务目标**：推送 `main` 后在 GitHub 编译前端，把静态资源传到腾讯云并在服务器上快速构建/重启 Nginx 容器。
 
 ---
 
@@ -23,17 +23,17 @@
 ```mermaid
 flowchart LR
   A[本地 push main] --> B[GitHub Actions]
-  B --> C[Docker Buildx 构建]
-  C --> D[推送到 ghcr.io]
+  B --> C[pnpm build:play]
+  C --> D[打包 tar 并 SCP]
   B --> E[SSH 登录腾讯云]
-  E --> F[docker pull]
+  E --> F[本地 docker build]
   F --> G[docker run 映射端口]
   G --> H[用户访问 宿主机:8090]
 ```
 
-1. **CI 构建**：`scripts/deploy/Dockerfile.playground` 多阶段构建（Node 编译 + Nginx 运行）。
-2. **镜像标签**：`latest` 与当前 commit SHA。
-3. **CD 部署**：`appleboy/ssh-action` 在目标机上 `pull` → `stop/rm` → `run`。
+1. **CI 构建**：`pnpm run build:play`（使用 `.github/actions/setup-node`）。
+2. **上传**：`deploy-bundle.tar.gz`（含 `dist`、`nginx.conf`、`Dockerfile.playground.runtime`）。
+3. **CD 部署**：服务器解压 → `docker build -t ten-admin-playground:<sha>` → `stop/rm/run`。
 
 工作流文件：`.github/workflows/deploy-playground-docker.yml`。
 
@@ -43,18 +43,18 @@ flowchart LR
 
 ### 3.1 Secrets（Settings → Secrets and variables → Actions → Secrets）
 
-| 名称 | 说明 |
-| --- | --- |
-| `DEPLOY_HOST` | 腾讯云服务器公网 IP 或域名 |
-| `DEPLOY_USER` | SSH 用户名（如 `root`、`ubuntu`） |
+| 名称             | 说明                                            |
+| ---------------- | ----------------------------------------------- |
+| `DEPLOY_HOST`    | 腾讯云服务器公网 IP 或域名                      |
+| `DEPLOY_USER`    | SSH 用户名（如 `root`、`ubuntu`）               |
 | `DEPLOY_SSH_KEY` | SSH **私钥**全文（PEM），对应服务器已授权的公钥 |
-| `GHCR_PULL_TOKEN` | （可选）私有 Package 拉取用 PAT，scope 含 `read:packages`；镜像公开时可省略 |
 
-### 3.2 Variables（可选）
+### 3.2 Variables
 
-| 名称                    | 默认值 | 说明                                    |
-| ----------------------- | ------ | --------------------------------------- |
-| `DEPLOY_CONTAINER_PORT` | `8090` | **宿主机**对外端口，映射到容器内 `8080` |
+| 名称 | 默认值 | 说明 |
+| --- | --- | --- |
+| `DEPLOY_CONTAINER_PORT` | `8090` | **宿主机**对外端口 → 容器 `8080` |
+| `DEPLOY_REMOTE_DIR` | `/var/tmp/ten-admin-playground` | SCP 上传与服务器 `docker build` 目录 |
 
 ### 3.3 工作流触发条件
 
@@ -69,8 +69,8 @@ flowchart LR
 
 1. 已安装 **Docker**，部署用户能执行 `docker`（或配置 `sudo docker` / `usermod -aG docker`）。
 2. **安全组 / 防火墙**放行 `DEPLOY_CONTAINER_PORT`（默认 **8090**）。
-3. 服务器能访问 `ghcr.io` 拉取镜像（国内可能较慢，工作流 `command_timeout` 为 45 分钟）。
-4. 若镜像私有：部署脚本会通过 `GHCR_PULL_TOKEN` 执行 `docker login ghcr.io`。
+3. 能访问 **Docker Hub** 拉取 `nginx:alpine`（首次 build；可配置镜像加速）。
+4. 开放 **22** 供 SCP/SSH；工作流 `command_timeout` 约 20 分钟（以 GHA 构建 + 上传为主）。
 
 ---
 
@@ -89,12 +89,12 @@ Docker 启动参数：`-p "${HOST_PORT}:8080"`（`HOST_PORT` 默认 8090）。
 
 ## 6. 镜像与容器
 
-| 项           | 值                                                       |
-| ------------ | -------------------------------------------------------- |
-| 容器名       | `ten-admin-playground`                                   |
-| 镜像         | `ghcr.io/ten-clock/ten-admin:latest`（及 `:sha`）        |
-| 重启策略     | `--restart unless-stopped`                               |
-| 静态资源路径 | 容器内 `/usr/share/nginx/html`（来自 `playground/dist`） |
+| 项           | 值                                                         |
+| ------------ | ---------------------------------------------------------- |
+| 容器名       | `ten-admin-playground`                                     |
+| 镜像（本地） | `ten-admin-playground:<git-sha>`（仅存于 CVM，无镜像仓库） |
+| 重启策略     | `--restart unless-stopped`                                 |
+| 静态资源路径 | 容器内 `/usr/share/nginx/html`（来自 `playground/dist`）   |
 
 ---
 
@@ -178,7 +178,8 @@ Host github.com
 | 现象 | 可能原因 | 处理 |
 | --- | --- | --- |
 | Actions SSH 步骤失败 | `DEPLOY_*` 配置错误、安全组未放行 22 | 核对 Secrets、腾讯云 SSH |
-| `docker pull` 超时 | 国内访问 ghcr 慢 | 重试、换时段，或配置镜像加速/代理 |
+| `docker build` 慢 | 首次拉 `nginx:alpine` 或 Docker Hub 慢 | 配置腾讯云 Docker 镜像加速 |
+| SCP 失败 | 磁盘满、`DEPLOY_REMOTE_DIR` 无写权限 | `mkdir -p` 目录、检查 ssh 用户权限 |
 | 浏览器打不开 | 未放行 8090 | 腾讯云安全组入站规则 |
 | 本地 `git push` reset | 未开代理或未配置 `http.https://github.com.proxy` | 开 Clash + 第 8.2 节配置 |
 | 容器启动但空白页 | 构建失败或 dist 未打入镜像 | 查看 Actions 构建日志、`docker logs` |
@@ -190,7 +191,8 @@ Host github.com
 | 文件 | 作用 |
 | --- | --- |
 | `.github/workflows/deploy-playground-docker.yml` | CI/CD 工作流 |
-| `scripts/deploy/Dockerfile.playground` | Playground 镜像定义 |
+| `scripts/deploy/Dockerfile.playground` | 本地/全量 Docker 多阶段构建（可选） |
+| `scripts/deploy/Dockerfile.playground.runtime` | 服务器仅用 dist 构建的 Dockerfile |
 | `scripts/deploy/nginx.conf` | 容器内 Nginx（监听 8080、SPA `try_files`） |
 
 ---

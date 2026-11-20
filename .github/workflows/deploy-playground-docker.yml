@@ -1,13 +1,16 @@
-# Playground：push main 后构建镜像并部署到腾讯云（Docker）
+# Playground：push main 后在 GHA 构建 dist，上传到腾讯云并在服务器本地 docker build（方案 2，无需 TCR/GHCR pull）
 #
-# 在 GitHub 仓库 Settings → Secrets and variables → Actions 中配置：
-#   DEPLOY_HOST          服务器 IP 或域名
-#   DEPLOY_USER          SSH 用户名（如 root、ubuntu）
-#   DEPLOY_SSH_KEY       SSH 私钥全文（PEM）
-#   GHCR_PULL_TOKEN      拉取私有镜像用 PAT（scope: read:packages）；公开 Package 可省略
+# 流程：
+#   1. pnpm build:play
+#   2. 打包 dist + nginx.conf + Dockerfile.playground.runtime
+#   3. SCP 到 CVM，docker build → run（仅首次或 nginx 基础层变更时需拉 Docker Hub）
 #
-# 可选 Variables：
-#   DEPLOY_CONTAINER_PORT  宿主机端口，默认 8090（映射容器 8080）
+# Secrets：
+#   DEPLOY_HOST / DEPLOY_USER / DEPLOY_SSH_KEY
+#
+# Variables：
+#   DEPLOY_CONTAINER_PORT  默认 8090 → 容器 8080
+#   DEPLOY_REMOTE_DIR      默认 /var/tmp/ten-admin-playground（上传与构建目录）
 #
 name: Deploy Playground Docker
 
@@ -19,12 +22,11 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
   CONTAINER_NAME: ten-admin-playground
+  IMAGE_NAME: ten-admin-playground
+  DEPLOY_REMOTE_DIR: ${{ vars.DEPLOY_REMOTE_DIR || '/var/tmp/ten-admin-playground' }}
 
 concurrency:
   group: deploy-playground-docker-${{ github.ref }}
@@ -32,7 +34,7 @@ concurrency:
 
 jobs:
   build-and-deploy:
-    name: Build image and deploy
+    name: Build dist and deploy on server
     if: >-
       github.event.repository.name == 'ten-admin'
       && github.actor != 'dependabot[bot]'
@@ -43,43 +45,44 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Setup Node
+        uses: ./.github/actions/setup-node
 
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build playground
+        run: pnpm run build:play
 
-      - name: Build and push image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: scripts/deploy/Dockerfile.playground
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Pack deploy bundle
+        run: |
+          rm -rf deploy-bundle deploy-bundle.tar.gz
+          mkdir -p deploy-bundle/playground
+          cp -r playground/dist deploy-bundle/playground/dist
+          cp scripts/deploy/nginx.conf deploy-bundle/nginx.conf
+          cp scripts/deploy/Dockerfile.playground.runtime deploy-bundle/Dockerfile
+          tar czf deploy-bundle.tar.gz -C deploy-bundle .
 
-      - name: Deploy on Tencent Cloud server
-        uses: appleboy/ssh-action@v1.2.2
-        env:
-          REGISTRY: ${{ env.REGISTRY }}
-          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
-          HOST_PORT: ${{ vars.DEPLOY_CONTAINER_PORT || '8090' }}
-          GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
-          GHCR_USER: ${{ github.repository_owner }}
+      - name: Upload bundle to server
+        uses: appleboy/scp-action@v1.0.0
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
-          command_timeout: 45m
-          envs: REGISTRY,IMAGE,CONTAINER_NAME,HOST_PORT,GHCR_PULL_TOKEN,GHCR_USER
+          source: deploy-bundle.tar.gz
+          target: ${{ env.DEPLOY_REMOTE_DIR }}
+
+      - name: Build image and restart container on server
+        uses: appleboy/ssh-action@v1.2.2
+        env:
+          DEPLOY_DIR: ${{ env.DEPLOY_REMOTE_DIR }}
+          IMAGE: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
+          HOST_PORT: ${{ vars.DEPLOY_CONTAINER_PORT || '8090' }}
+          DEPLOY_SHA: ${{ github.sha }}
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          command_timeout: 20m
+          envs: DEPLOY_DIR,IMAGE,CONTAINER_NAME,HOST_PORT,DEPLOY_SHA
           script: |
             set -e
             if docker info >/dev/null 2>&1; then
@@ -90,12 +93,19 @@ jobs:
               echo "Cannot access Docker. Run: sudo usermod -aG docker $USER && re-login"
               exit 1
             fi
-            echo "==> login ghcr.io"
-            if [ -n "$GHCR_PULL_TOKEN" ]; then
-              echo "$GHCR_PULL_TOKEN" | $DOCKER login "$REGISTRY" -u "$GHCR_USER" --password-stdin
+            mkdir -p "$DEPLOY_DIR"
+            cd "$DEPLOY_DIR"
+            tar xzf deploy-bundle.tar.gz
+            RUNNING_IMAGE=""
+            if $DOCKER inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+              RUNNING_IMAGE=$($DOCKER inspect --format '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null || true)
             fi
-            echo "==> pull $IMAGE (may take several minutes from China)"
-            $DOCKER pull "$IMAGE"
+            if [ "$RUNNING_IMAGE" = "$IMAGE" ]; then
+              echo "==> skip: container already runs $IMAGE"
+              exit 0
+            fi
+            echo "==> docker build $IMAGE (local, no registry pull)"
+            $DOCKER build -t "$IMAGE" -f Dockerfile .
             echo "==> restart container"
             $DOCKER stop "$CONTAINER_NAME" 2>/dev/null || true
             $DOCKER rm "$CONTAINER_NAME" 2>/dev/null || true

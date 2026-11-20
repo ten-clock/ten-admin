@@ -1,0 +1,12 @@
+# 服务器本地构建：由 CI 上传 playground/dist + nginx.conf，无需在服务器拉取 GHCR/TCR
+FROM nginx:alpine
+
+RUN echo "types { application/javascript js mjs; }" > /etc/nginx/conf.d/mjs.conf \
+    && rm -rf /etc/nginx/conf.d/default.conf
+
+COPY playground/dist /usr/share/nginx/html
+COPY nginx.conf /etc/nginx/nginx.conf
+
+EXPOSE 8080
+
+CMD ["nginx", "-g", "daemon off;"]
