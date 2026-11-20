@@ -343,6 +343,15 @@ const routes: RouteRecordRaw[] = [
         },
       },
       {
+        name: 'RadarExample',
+        path: 'radar',
+        component: () => import('#/views/examples/radar/index.vue'),
+        meta: {
+          icon: 'mdi:radar',
+          title: $t('examples.radar.title'),
+        },
+      },
+      {
         name: 'CountTo',
         path: 'count-to',
         component: () => import('#/views/examples/count-to/index.vue'),

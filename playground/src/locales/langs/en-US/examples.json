@@ -89,5 +89,8 @@
   },
   "tiptap": {
     "title": "Rich Text Editor"
+  },
+  "radar": {
+    "title": "Radar Sweep"
   }
 }
